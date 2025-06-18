@@ -29,3 +29,9 @@ fliplr: 0.5  # horizontal flip augmentation
 hsv_h: 0.015  # HSV-Hue augmentation
 hsv_s: 0.7  # HSV-Saturation augmentation
 hsv_v: 0.4  # HSV-Value augmentation 
+fl_gamma: 0.0  # gamma augmentation
+cls_pw: 1.0  # class weights
+obj_pw: 1.0  # object weights
+
+# For imbalanced datasets
+class_weights: 
