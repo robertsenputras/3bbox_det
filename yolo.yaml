@@ -1,0 +1,31 @@
+path: yolo_dataset  # dataset root dir
+train: train/images  # train images (relative to 'path')
+val: val/images  # val images (relative to 'path')
+
+# Classes
+names: ['object']  # class names
+
+# Dataset information
+nc: 1  # number of classes
+task: segment  # detection or segment
+
+# Training parameters
+box: True  # train with bounding box loss
+segments: True  # train with segmentation loss
+mask_ratio: 4  # mask downsample ratio
+overlap: True  # allow overlapping instances
+
+# Augmentation parameters
+mosaic: 1.0  # mosaic augmentation
+mixup: 0.5  # mixup augmentation
+copy_paste: 0.5  # copy-paste augmentation
+degrees: 45  # rotation augmentation
+translate: 0.1  # translation augmentation
+scale: 0.5  # scale augmentation
+shear: 0.0  # shear augmentation
+perspective: 0.0  # perspective augmentation
+flipud: 0.5  # vertical flip augmentation
+fliplr: 0.5  # horizontal flip augmentation
+hsv_h: 0.015  # HSV-Hue augmentation
+hsv_s: 0.7  # HSV-Saturation augmentation
+hsv_v: 0.4  # HSV-Value augmentation 

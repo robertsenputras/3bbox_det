@@ -1,0 +1,19 @@
+path: coco_dataset  # dataset root dir
+train: images/train  # train images (relative to 'path')
+val: images/val  # val images (relative to 'path')
+
+# Classes
+names: ['object']  # class names
+
+# Dataset information
+nc: 1  # number of classes
+task: segment  # detection or segment
+mode: train  # train or val
+format: coco  # format of annotations
+
+# Training parameters
+box: True  # train with bounding box loss
+segments: True  # train with segmentation loss
+overlap: True  # allow overlapping instances
+mask_ratio: 4  # mask downsample ratio
+mask_overlap: True  # allow mask overlap 
