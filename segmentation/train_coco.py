@@ -1,6 +1,8 @@
 from ultralytics import YOLO
 import os
 
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
 def train_with_freezing_schedule():
     """
     Train model with a two-stage approach:
@@ -13,23 +15,23 @@ def train_with_freezing_schedule():
     model = YOLO("yolo11m-seg.pt")
     
     # Train with frozen backbone
-    results_stage1 = model.train(
+    model.train(
         data="yolo.yaml", 
-        epochs=10, 
+        epochs=30, 
         imgsz=(640, 640), 
         batch=16, 
         workers=8, 
-        device="mps", 
+        device=0,
         save=True, 
         freeze=10,  # Freeze first 10 layers
         lr0=0.0005, 
-        patience=50, 
+        patience=15,  # Stop if no improvement for 15 epochs
         save_period=10,
         name="stage1_frozen"  # Custom name for this training run
     )
     
     # Get the path to the best model from stage 1
-    stage1_best_model = results_stage1.save_dir / "weights" / "best.pt"
+    stage1_best_model = "runs/segment/stage1_frozen/weights/best.pt"
     print(f"Stage 1 completed. Best model saved at: {stage1_best_model}")
     
     # Stage 2: Resume training with unfrozen weights for 50 more epochs
@@ -39,26 +41,24 @@ def train_with_freezing_schedule():
     model_stage2 = YOLO(stage1_best_model)
     
     # Train with unfrozen weights
-    results_stage2 = model_stage2.train(
+    model_stage2.train(
         data="yolo.yaml", 
         epochs=50, 
         imgsz=(640, 640), 
         batch=16, 
         workers=8, 
-        device="mps", 
+        device=0,
         save=True, 
         freeze=0,  # No freezing - all layers trainable
         lr0=0.0001,  # Lower learning rate for fine-tuning
-        patience=50, 
+        patience=10,  # Stop if no improvement for 10 epochs
         save_period=10,
         name="stage2_unfrozen",  # Custom name for this training run
-        resume=False  # Start fresh training (not resume from checkpoint)
+        resume=False  # Start a new training using the stage1 weights
     )
     
-    stage2_best_model = results_stage2.save_dir / "weights" / "best.pt"
+    stage2_best_model = "runs/segment/stage2_unfrozen/weights/best.pt"
     print(f"Stage 2 completed. Final best model saved at: {stage2_best_model}")
-    
-    return results_stage1, results_stage2
 
 def resume_existing_training(checkpoint_path, additional_epochs=50):
     """
@@ -74,13 +74,13 @@ def resume_existing_training(checkpoint_path, additional_epochs=50):
     model = YOLO(checkpoint_path)
     
     # Resume training with unfrozen weights
-    results = model.train(
+    model.train(
         data="yolo.yaml", 
         epochs=additional_epochs, 
         imgsz=(640, 640), 
         batch=16, 
         workers=8, 
-        device="mps", 
+        device=0,  # Changed back to GPU
         save=True, 
         freeze=0,  # Unfreeze all layers
         lr0=0.0001,  # Lower learning rate for fine-tuning
@@ -90,11 +90,13 @@ def resume_existing_training(checkpoint_path, additional_epochs=50):
         resume=False  # Start new training session
     )
     
-    return results
+    final_model = "runs/segment/resumed_unfrozen/weights/best.pt"
+    print(f"Training completed. Final model saved at: {final_model}")
+    return final_model
 
 if __name__ == "__main__":
     # Option 1: Full two-stage training from scratch
-    results_stage1, results_stage2 = train_with_freezing_schedule()
+    train_with_freezing_schedule()
     
     # # Option 2: Resume from existing model (if you already have a trained model)
     # # Uncomment and modify the path below if you want to resume from existing model
@@ -109,9 +111,9 @@ if __name__ == "__main__":
     #     choice = "1"  # Change to "2" if you want fresh training
         
     #     if choice == "1":
-    #         results = resume_existing_training(existing_model_path, additional_epochs=50)
+    #         final_model = resume_existing_training(existing_model_path, additional_epochs=50)
     #     else:
-    #         results_stage1, results_stage2 = train_with_freezing_schedule()
+    #         train_with_freezing_schedule()
     # else:
     #     print("No existing model found. Starting fresh two-stage training.")
-    #     results_stage1, results_stage2 = train_with_freezing_schedule()
+    #     train_with_freezing_schedule()

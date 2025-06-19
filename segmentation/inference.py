@@ -126,7 +126,7 @@ def visualize_prediction(image, results, save_path=None, conf_threshold=0.25, or
         plt.savefig(save_path, bbox_inches='tight', pad_inches=0)
         print(f"Visualization saved to {save_path}")
     
-    plt.show()
+    # plt.show()
 
 def filter_detections(boxes, scores, cls, masks, 
                      conf_threshold=0.25,
@@ -286,9 +286,9 @@ def run_inference(model_path, image_paths, output_dir="predictions",
         # Apply filtering and NMS if we have detections
         if results[0].boxes is not None and len(results[0].boxes) > 0:
             # Get boxes, scores and masks
-            boxes = results[0].boxes.xyxy
-            scores = results[0].boxes.conf
-            cls = results[0].boxes.cls
+            boxes = results[0].boxes.xyxy.cpu()  # Move to CPU
+            scores = results[0].boxes.conf.cpu()  # Move to CPU
+            cls = results[0].boxes.cls.cpu()  # Move to CPU
             masks = results[0].masks
             
             # Get original number of detections
@@ -306,11 +306,16 @@ def run_inference(model_path, image_paths, output_dir="predictions",
                 # Apply NMS on filtered detections
                 boxes_filtered = boxes[quality_indices]
                 scores_filtered = scores[quality_indices]
-                cls_filtered = cls[quality_indices]
+                
+                # Ensure tensors are on CPU for NMS
+                boxes_filtered = boxes_filtered.cpu()
+                scores_filtered = scores_filtered.cpu()
                 
                 nms_indices = apply_nms(boxes_filtered, scores_filtered, masks.data, iou_threshold)
                 
-                # Combine indices
+                # Combine indices (ensure both are on CPU)
+                quality_indices = quality_indices.cpu()
+                nms_indices = nms_indices.cpu()
                 final_indices = quality_indices[nms_indices]
                 
                 # Create new Results object with filtered detections
@@ -364,20 +369,37 @@ def run_inference(model_path, image_paths, output_dir="predictions",
         else:
             print("No valid detections found")
 
+def get_validation_images(val_dir):
+    """
+    Get all image paths from the validation directory.
+    
+    Args:
+        val_dir: Path to validation images directory
+    
+    Returns:
+        List of image paths
+    """
+    image_paths = []
+    for filename in sorted(os.listdir(val_dir)):
+        if filename.lower().endswith(('.jpg', '.jpeg', '.png')):
+            image_paths.append(os.path.join(val_dir, filename))
+    return image_paths
+
 if __name__ == "__main__":
     # Configuration
-    MODEL_PATH = "19June_0022.pt"
+    MODEL_PATH = "ckpt/19June_1026.pt"
+    VAL_DIR = "yolo_dataset/val/images"
+    OUTPUT_DIR = "predictions/validation_results"
     
-    # Example usage with two images from yolo_dataset
-    IMAGE_PATHS = [
-        "yolo_dataset/val/images/000001.jpg",  # Replace with your image paths
-        "yolo_dataset/val/images/000002.jpg"
-    ]
+    # Get all validation images
+    image_paths = get_validation_images(VAL_DIR)
+    print(f"Found {len(image_paths)} validation images")
     
     # Run inference with additional filtering
     run_inference(
         MODEL_PATH, 
-        IMAGE_PATHS, 
+        image_paths, 
+        output_dir=OUTPUT_DIR,
         conf_threshold=0.25,
         iou_threshold=0.3,
         max_box_ratio=0.8,  # Maximum box size as ratio of image area (80%)
