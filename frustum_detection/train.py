@@ -1,9 +1,14 @@
+import sys
+import os
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(BASE_DIR)
+sys.path.append(os.path.join(BASE_DIR, 'frustum_pointnets_pytorch'))
+
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
 import numpy as np
 from pathlib import Path
-import sys
 from tqdm import tqdm
 import logging
 import yaml
@@ -11,6 +16,8 @@ from datetime import datetime
 
 # Import the model directly from your frustum_detection directory
 from frustum_pointnets_pytorch.models.frustum_pointnets_v1 import FrustumPointNetv1
+from frustum_pointnets_pytorch.train.provider_fpointnet import compute_box3d_iou
+from frustum_pointnets_pytorch.models.model_util import FrustumPointNetLoss
 from dataset import FrustumDataset
 
 def setup_logging(output_dir):
@@ -23,6 +30,65 @@ def setup_logging(output_dir):
             logging.StreamHandler()
         ]
     )
+
+class FrustumLoss:
+    def __init__(self, device):
+        self.device = device
+        self.Loss = FrustumPointNetLoss().to(device)
+
+    def compute_loss(self, predictions, targets):
+        """
+        Compute all losses and metrics
+        Args:
+            predictions: dict containing model predictions
+            targets: dict containing ground truth
+        Returns:
+            losses: dict of loss values
+            metrics: dict of metrics
+        """
+        bs = predictions['logits'].shape[0]
+
+        losses = self.Loss(
+            predictions['logits'], targets['seg'],
+            predictions['box3d_center'], targets['box3d_center'], 
+            predictions['stage1_center'],
+            predictions['heading_scores'], predictions['heading_residual_normalized'],
+            predictions['heading_residual'],
+            targets['angle_class'], targets['angle_residual'],
+            predictions['size_scores'], predictions['size_residual_normalized'],
+            predictions['size_residual'],
+            targets['size_class'], targets['size_residual']
+        )
+        # Normalize losses by batch size
+        for key in losses.keys():
+            losses[key] = losses[key]/bs
+
+        # Compute metrics
+        with torch.no_grad():
+            seg_correct = torch.argmax(predictions['logits'].detach().cpu(), 2).eq(targets['seg'].detach().cpu()).numpy()
+            seg_accuracy = np.sum(seg_correct) / float(predictions['logits'].shape[2])
+
+            iou2ds, iou3ds = compute_box3d_iou(
+                predictions['box3d_center'].detach().cpu().numpy(),
+                predictions['heading_scores'].detach().cpu().numpy(),
+                predictions['heading_residual'].detach().cpu().numpy(),
+                predictions['size_scores'].detach().cpu().numpy(),
+                predictions['size_residual'].detach().cpu().numpy(),
+                targets['box3d_center'].detach().cpu().numpy(),
+                targets['angle_class'].detach().cpu().numpy(),
+                targets['angle_residual'].detach().cpu().numpy(),
+                targets['size_class'].detach().cpu().numpy(),
+                targets['size_residual'].detach().cpu().numpy()
+            )
+
+        metrics = {
+            'seg_acc': seg_accuracy,
+            'iou2d': iou2ds.mean(),
+            'iou3d': iou3ds.mean(),
+            'iou3d_0.7': np.sum(iou3ds >= 0.7)/bs
+        }
+
+        return losses, metrics
 
 class Trainer:
     def __init__(self, config):
@@ -45,6 +111,9 @@ class Trainer:
         
         # Initialize model
         self.model = self._init_model()
+        
+        # Initialize loss
+        self.criterion = FrustumLoss(self.device)
         
         # Initialize optimizer
         self.optimizer = optim.Adam(
@@ -109,22 +178,16 @@ class Trainer:
         logging.info(f"Number of training scenes: {len(train_scenes)}")
         logging.info(f"Number of validation scenes: {len(val_scenes)}")
         
-        # Create datasets
+        # Create datasets with simplified parameters
         train_dataset = FrustumDataset(
             data_path=self.config['data_root'],
             scene_list=train_scenes,
-            rotate_to_center=self.config['rotate_to_center'],
-            random_flip=self.config['random_flip'],
-            random_shift=self.config['random_shift'],
             num_points=self.config['num_points']
         )
         
         val_dataset = FrustumDataset(
             data_path=self.config['data_root'],
             scene_list=val_scenes,
-            rotate_to_center=self.config['rotate_to_center'],
-            random_flip=False,
-            random_shift=False,
             num_points=self.config['num_points']
         )
         
@@ -158,12 +221,13 @@ class Trainer:
             data_dicts = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
                          for k, v in batch.items()}
             
+            
             # Forward pass
             self.optimizer.zero_grad()
+            predictions = self.model(data_dicts)
             
-            # Ensure model is on correct device
-            self.model = self.model.to(self.device)
-            losses, metrics = self.model(data_dicts)
+            # Compute loss and metrics
+            losses, metrics = self.criterion.compute_loss(predictions, data_dicts)
             
             # Total loss
             total_loss = sum(losses.values())
@@ -171,6 +235,11 @@ class Trainer:
             # Backward pass
             total_loss.backward()
             self.optimizer.step()
+            
+            # Log metrics
+            if self.config.get('log_metrics_every', 0) > 0 and batch % self.config['log_metrics_every'] == 0:
+                logging.info(f"Metrics: {metrics}")
+                logging.info(f"Losses: {losses}")
             
             total_loss += total_loss.item()
             
@@ -189,10 +258,19 @@ class Trainer:
                             for k, v in batch.items()}
                 
                 # Forward pass
-                losses, metrics = self.model(data_dicts)
+                predictions = self.model(data_dicts)
+                
+                # Compute loss and metrics
+                losses, metrics = self.criterion.compute_loss(predictions, data_dicts)
                 
                 # Total loss
-                total_loss += sum(losses.values()).item()
+                batch_loss = sum(losses.values()).item()
+                total_loss += batch_loss
+                
+                # Log validation metrics
+                if self.config.get('log_val_metrics_every', 0) > 0 and batch % self.config['log_val_metrics_every'] == 0:
+                    logging.info(f"Validation Metrics: {metrics}")
+                    logging.info(f"Validation Losses: {losses}")
         
         return total_loss / num_batches
     

@@ -1,0 +1,20 @@
+# Model configuration
+model_version: 'v1'  # Only v1 is supported currently
+weights_path: '2006_1700.pth'  # Path to trained weights
+
+# Data configuration
+data_root: '../data/dl_challenge'  # Path to validation data
+num_points: 2048  # Number of points per frustum
+train_val_split: 0.8  # Same split ratio as training
+rotate_to_center: true  # Whether to rotate frustums to face forward
+random_flip: false  # Whether to randomly flip data during testing
+random_shift: false  # Whether to randomly shift points during testing
+
+# Hardware configuration
+device: 'cuda'  # 'cuda' or 'cpu'
+num_workers: 4
+
+# Visualization configuration
+min_score: 0.5  # Minimum confidence score for visualization
+point_size: 2.0  # Point cloud visualization size
+background_color: [0.1, 0.1, 0.1]  # Background color for visualization 
