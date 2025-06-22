@@ -11,8 +11,8 @@ random_flip: false  # Whether to randomly flip data during training
 random_shift: false  # Whether to randomly shift points during training
 
 # Training configuration
-batch_size: 16
-num_epochs: 50
+batch_size: 8
+num_epochs: 100
 learning_rate: 0.001
 weight_decay: 0.0001
 lr_step_size: 20

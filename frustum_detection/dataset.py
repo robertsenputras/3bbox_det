@@ -173,12 +173,19 @@ class FrustumDataset(Dataset):
         masks = np.load(self.seg_files[idx])   # (N,H,W) segmentation masks
         
         # Process all objects
-        points, masks = self.process_point_cloud(points, masks)
+        points_all, masks_all = self.process_point_cloud(points, masks)
         
-        # Process first object (similar to provider_fpointnet.py)
-        if len(boxes) > 0:
+        # Initialize lists to store processed data for each object
+        centers = []
+        heading_classes = []
+        heading_residuals = []
+        size_classes = []
+        size_residuals = []
+        
+        # Process each box
+        for i, box in enumerate(boxes):
             # Get box parameters
-            center, size, heading_angle = self.corners_to_params(boxes[0])
+            center, size, heading_angle = self.corners_to_params(box)
             
             # Get heading class and residual
             heading_class, heading_residual = self.get_heading_angle(heading_angle)
@@ -186,44 +193,54 @@ class FrustumDataset(Dataset):
             # Get size class and residual
             size_class, size_residual = self.get_size_class(size)
             
-            # Use first processed point cloud and mask
-            points = points[0]  # (num_points, 4)
-            mask = masks[0]    # (num_points,)
-        else:
-            # If no boxes, use default values
-            center = np.zeros(3, dtype=np.float32)
-            heading_class, heading_residual = 0, 0
-            size_class, size_residual = 0, np.zeros(3, dtype=np.float32)
-            points = np.zeros((self.num_points, 4), dtype=np.float32)
-            mask = np.zeros(self.num_points, dtype=np.float32)
+            centers.append(center)
+            heading_classes.append(heading_class)
+            heading_residuals.append(heading_residual)
+            size_classes.append(size_class)
+            size_residuals.append(size_residual)
+        
+        # Convert to numpy arrays
+        centers = np.stack(centers) if centers else np.zeros((0, 3), dtype=np.float32)
+        heading_classes = np.array(heading_classes) if heading_classes else np.zeros(0, dtype=np.int64)
+        heading_residuals = np.array(heading_residuals) if heading_residuals else np.zeros(0, dtype=np.float32)
+        size_classes = np.array(size_classes) if size_classes else np.zeros(0, dtype=np.int64)
+        size_residuals = np.stack(size_residuals) if size_residuals else np.zeros((0, 3), dtype=np.float32)
         
         # Create one-hot vector (3D for network compatibility)
         one_hot = np.zeros(3, dtype=np.float32)  # Keep as 3D for network compatibility
         one_hot[0] = 1  # First class only
         
         # Convert to tensors
-        points = torch.from_numpy(points.astype(np.float32))  # (num_points, 4)
-        points = points.transpose(0, 1)  # Change to (4, num_points) for network
-        mask = torch.from_numpy(mask.astype(np.float32))
-        center = torch.from_numpy(center.astype(np.float32))
-        heading_class = torch.tensor(heading_class, dtype=torch.long)
-        heading_residual = torch.tensor(heading_residual, dtype=torch.float32)
-        size_class = torch.tensor(size_class, dtype=torch.long)
-        size_residual = torch.from_numpy(size_residual.astype(np.float32))
+        points_all = torch.from_numpy(points_all.astype(np.float32))  # (N, num_points, 4)
+        points_all = points_all.transpose(1, 2)  # Change to (N, 4, num_points) for network
+        masks_all = torch.from_numpy(masks_all.astype(np.float32))  # (N, num_points)
+        centers = torch.from_numpy(centers.astype(np.float32))  # (N, 3)
+        heading_classes = torch.tensor(heading_classes, dtype=torch.long)  # (N,)
+        heading_residuals = torch.tensor(heading_residuals, dtype=torch.float32)  # (N,)
+        size_classes = torch.tensor(size_classes, dtype=torch.long)  # (N,)
+        size_residuals = torch.from_numpy(size_residuals.astype(np.float32))  # (N, 3)
         one_hot = torch.from_numpy(one_hot)  # Keep as 3D vector
-        rot_angle = torch.zeros(1)  # No rotation angle since we removed augmentation
-
+        rot_angle = torch.zeros(points_all.size(0))  # (N,) No rotation angle since we removed augmentation
+        
+        # print("points_all", points_all.shape)
+        # print("masks_all", masks_all.shape)
+        # print("centers", centers.shape)
+        # print("heading_classes", heading_classes.shape)
+        # print("heading_residuals", heading_residuals.shape)
+        # print("size_classes", size_classes.shape)
+        # print("size_residuals", size_residuals.shape)
         # Create the data dictionary matching provider_fpointnet.py format
         data_dict = {
-            'point_cloud': points,  # (4, num_points)
+            'point_cloud': points_all,  # (N, 4, num_points)
             'one_hot': one_hot,    # (3,) - 3D one-hot vector for network compatibility
-            'seg': mask,           # (num_points,)
-            'box3d_center': center,  # (3,)
-            'size_class': size_class,  # scalar
-            'size_residual': size_residual,  # (3,)
-            'angle_class': heading_class,  # scalar
-            'angle_residual': heading_residual,  # scalar
-            'rot_angle': rot_angle  # (1,)
+            'seg': masks_all,      # (N, num_points)
+            'box3d_center': centers,  # (N, 3)
+            'size_class': size_classes,  # (N,)
+            'size_residual': size_residuals,  # (N, 3)
+            'angle_class': heading_classes,  # (N,)
+            'angle_residual': heading_residuals,  # (N,)
+            'rot_angle': rot_angle,  # (N,)
+            'num_objects': torch.tensor(len(boxes), dtype=torch.long)  # Scalar indicating number of objects
         }
         
         return data_dict 

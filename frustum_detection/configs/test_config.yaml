@@ -1,6 +1,6 @@
 # Model configuration
 model_version: 'v1'  # Only v1 is supported currently
-weights_path: '2006_1700.pth'  # Path to trained weights
+weights_path: '2006_1814.pth'  # Path to trained weights
 
 # Data configuration
 data_root: '../data/dl_challenge'  # Path to validation data

@@ -18,7 +18,72 @@ from datetime import datetime
 from frustum_pointnets_pytorch.models.frustum_pointnets_v1 import FrustumPointNetv1
 from frustum_pointnets_pytorch.train.provider_fpointnet import compute_box3d_iou
 from frustum_pointnets_pytorch.models.model_util import FrustumPointNetLoss
+from frustum_pointnets_pytorch.train import provider_fpointnet
 from dataset import FrustumDataset
+
+def custom_collate_fn(batch):
+    """Custom collate function to handle batches with different numbers of objects
+    Args:
+        batch: List of dictionaries from __getitem__
+    Returns:
+        Collated batch with padded tensors
+    """
+    # Find maximum number of objects in this batch
+    max_objects = max([b['point_cloud'].size(0) for b in batch])
+    
+    # Initialize the collated batch
+    collated_batch = {}
+    
+    # Handle each key in the batch
+    for key in batch[0].keys():
+        if key == 'num_objects':
+            # Just stack the number of objects
+            collated_batch[key] = torch.stack([b[key] for b in batch])
+            continue
+            
+        if key == 'one_hot':
+            # One hot is already fixed size
+            collated_batch[key] = torch.stack([b[key] for b in batch])
+            continue
+            
+        if isinstance(batch[0][key], torch.Tensor):
+            # Get the shape of the tensor
+            tensor_shape = batch[0][key].shape
+            
+            # Create padded tensors for each item in batch
+            if len(tensor_shape) == 1:  # For 1D tensors like rot_angle
+                padded = [torch.cat([b[key], 
+                                   torch.zeros(max_objects - len(b[key]), 
+                                             dtype=b[key].dtype, 
+                                             device=b[key].device)]) 
+                         for b in batch]
+            elif len(tensor_shape) == 2:  # For 2D tensors
+                if key in ['size_residual', 'box3d_center']:  # Special case for Nx3 tensors
+                    padded = [torch.cat([b[key], 
+                                       torch.zeros(max_objects - b[key].size(0), 3,
+                                                 dtype=b[key].dtype,
+                                                 device=b[key].device)], 0)
+                             for b in batch]
+                else:  # For other 2D tensors
+                    padded = [torch.cat([b[key],
+                                       torch.zeros(max_objects - b[key].size(0),
+                                                 b[key].size(1),
+                                                 dtype=b[key].dtype,
+                                                 device=b[key].device)], 0)
+                             for b in batch]
+            elif len(tensor_shape) == 3:  # For 3D tensors like point_cloud
+                padded = [torch.cat([b[key],
+                                   torch.zeros(max_objects - b[key].size(0),
+                                             b[key].size(1),
+                                             b[key].size(2),
+                                             dtype=b[key].dtype,
+                                             device=b[key].device)], 0)
+                         for b in batch]
+                
+            # Stack the padded tensors
+            collated_batch[key] = torch.stack(padded)
+    
+    return collated_batch
 
 def setup_logging(output_dir):
     """Setup logging configuration"""
@@ -47,48 +112,63 @@ class FrustumLoss:
             metrics: dict of metrics
         """
         bs = predictions['logits'].shape[0]
-
-        losses = self.Loss(
-            predictions['logits'], targets['seg'],
-            predictions['box3d_center'], targets['box3d_center'], 
-            predictions['stage1_center'],
-            predictions['heading_scores'], predictions['heading_residual_normalized'],
-            predictions['heading_residual'],
-            targets['angle_class'], targets['angle_residual'],
-            predictions['size_scores'], predictions['size_residual_normalized'],
-            predictions['size_residual'],
-            targets['size_class'], targets['size_residual']
-        )
-        # Normalize losses by batch size
-        for key in losses.keys():
-            losses[key] = losses[key]/bs
+        
+        # Get actual number of objects for each batch item
+        num_objects = targets['num_objects']  # (B,)
+        max_objects = predictions['logits'].shape[1]
+        
+        # Create mask for valid objects
+        valid_mask = torch.zeros((bs, max_objects), dtype=torch.bool, device=self.device)
+        for i in range(bs):
+            valid_mask[i, :num_objects[i]] = True
+        
+        # Compute losses only for valid objects
+        loss, loss_dict = self.Loss(predictions, targets, valid_mask)
+        
+        # Normalize losses by actual number of objects
+        total_objects = num_objects.sum().item()
+        if total_objects > 0:
+            loss = loss / total_objects
+            for key in loss_dict:
+                loss_dict[key] = loss_dict[key] / total_objects
 
         # Compute metrics
         with torch.no_grad():
-            seg_correct = torch.argmax(predictions['logits'].detach().cpu(), 2).eq(targets['seg'].detach().cpu()).numpy()
-            seg_accuracy = np.sum(seg_correct) / float(predictions['logits'].shape[2])
+            # Reshape logits and targets for accuracy computation
+            valid_logits = predictions['logits'][valid_mask]
+            valid_targets = targets['seg'][valid_mask]
+            n_points = valid_logits.shape[-1]
+            
+            # Compute segmentation accuracy
+            seg_correct = torch.argmax(valid_logits.detach().cpu(), 2).eq(valid_targets.detach().cpu()).numpy()
+            seg_accuracy = np.sum(seg_correct) / float(seg_correct.size) if seg_correct.size > 0 else 0.0
 
-            iou2ds, iou3ds = compute_box3d_iou(
-                predictions['box3d_center'].detach().cpu().numpy(),
-                predictions['heading_scores'].detach().cpu().numpy(),
-                predictions['heading_residual'].detach().cpu().numpy(),
-                predictions['size_scores'].detach().cpu().numpy(),
-                predictions['size_residual'].detach().cpu().numpy(),
-                targets['box3d_center'].detach().cpu().numpy(),
-                targets['angle_class'].detach().cpu().numpy(),
-                targets['angle_residual'].detach().cpu().numpy(),
-                targets['size_class'].detach().cpu().numpy(),
-                targets['size_residual'].detach().cpu().numpy()
-            )
+            # Compute IoU metrics only for valid objects
+            if total_objects > 0:
+                iou2ds, iou3ds = compute_box3d_iou(
+                    predictions['box3d_center'][valid_mask].detach().cpu().numpy(),
+                    predictions['heading_scores'][valid_mask].detach().cpu().numpy(),
+                    predictions['heading_residual'][valid_mask].detach().cpu().numpy(),
+                    predictions['size_scores'][valid_mask].detach().cpu().numpy(),
+                    predictions['size_residual'][valid_mask].detach().cpu().numpy(),
+                    targets['box3d_center'][valid_mask].detach().cpu().numpy(),
+                    targets['angle_class'][valid_mask].detach().cpu().numpy(),
+                    targets['angle_residual'][valid_mask].detach().cpu().numpy(),
+                    targets['size_class'][valid_mask].detach().cpu().numpy(),
+                    targets['size_residual'][valid_mask].detach().cpu().numpy()
+                )
+            else:
+                iou2ds = np.array([0.0])
+                iou3ds = np.array([0.0])
 
         metrics = {
             'seg_acc': seg_accuracy,
             'iou2d': iou2ds.mean(),
             'iou3d': iou3ds.mean(),
-            'iou3d_0.7': np.sum(iou3ds >= 0.7)/bs
+            'iou3d_0.7': np.sum(iou3ds >= 0.7)/total_objects if total_objects > 0 else 0.0
         }
 
-        return losses, metrics
+        return loss_dict, metrics
 
 class Trainer:
     def __init__(self, config):
@@ -191,13 +271,14 @@ class Trainer:
             num_points=self.config['num_points']
         )
         
-        # Create dataloaders
+        # Create dataloaders with custom collate function
         train_loader = DataLoader(
             train_dataset,
             batch_size=self.config['batch_size'],
             shuffle=True,
             num_workers=self.config['num_workers'],
-            pin_memory=True
+            pin_memory=True,
+            collate_fn=custom_collate_fn  # Use our custom collate function
         )
         
         val_loader = DataLoader(
@@ -205,7 +286,8 @@ class Trainer:
             batch_size=self.config['batch_size'],
             shuffle=False,
             num_workers=self.config['num_workers'],
-            pin_memory=True
+            pin_memory=True,
+            collate_fn=custom_collate_fn  # Use our custom collate function
         )
         
         return train_loader, val_loader
@@ -220,7 +302,14 @@ class Trainer:
             # Move all data to device
             data_dicts = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
                          for k, v in batch.items()}
-            
+            # # print all shape
+            # print("point_cloud", data_dicts['point_cloud'].shape)
+            # print("one_hot", data_dicts['one_hot'].shape)
+            # print("box3d_center", data_dicts['box3d_center'].shape)
+            # print("seg", data_dicts['seg'].shape)
+            # print("size_class", data_dicts['size_class'].shape)
+            # print("size_residual", data_dicts['size_residual'].shape)
+            # print("angle_class", data_dicts['angle_class'].shape)
             
             # Forward pass
             self.optimizer.zero_grad()

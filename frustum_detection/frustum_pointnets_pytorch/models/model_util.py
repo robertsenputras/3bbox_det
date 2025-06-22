@@ -1,71 +1,98 @@
 import os
 import sys
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.append(BASE_DIR)
 import numpy as np
 import torch
-import ipdb
 import torch.nn as nn
 import torch.nn.functional as F
-
 
 # -----------------
 # Global Constants
 # -----------------
-
 NUM_HEADING_BIN = 12
-NUM_SIZE_CLUSTER = 1  # Only one class for object detection
+NUM_SIZE_CLUSTER = 1  # Single class for object detection
 NUM_OBJECT_POINT = 512
 
-# Single class mappings
+# Class mappings
 g_type2class = {'Object': 0}
 g_class2type = {0: 'Object'}
 g_type2onehotclass = {'Object': 0}
 
-# Single class mean size (example values - adjust these based on your data)
+# Mean size for single class (example values - adjust based on your data)
 g_type_mean_size = {'Object': np.array([0.2, 0.2, 0.2])}  # [length, width, height]
-
 g_mean_size_arr = np.zeros((NUM_SIZE_CLUSTER, 3))
 g_mean_size_arr[0,:] = g_type_mean_size['Object']
 
-def parse_output_to_tensors(box_pred, logits, mask, stage1_center):
-    '''
-    :param box_pred: (bs,59)
-    :param logits: (bs,1024,2)
-    :param mask: (bs,1024)
-    :param stage1_center: (bs,3)
-    :return:
-        center_boxnet:(bs,3)
-        heading_scores:(bs,12)
-        heading_residual_normalized:(bs,12),-1 to 1
-        heading_residual:(bs,12)
-        size_scores:(bs,1)
-        size_residual_normalized:(bs,1,3)
-        size_residual:(bs,1,3)
-    '''
-    bs = box_pred.shape[0]
-    # center
-    center_boxnet = box_pred[:, :3]
-    c = 3
+def ensure_tensor(x, dtype=torch.float32, device=None):
+    """Convert input to tensor with specified dtype and device."""
+    if not isinstance(x, torch.Tensor):
+        x = torch.tensor(x, dtype=dtype)
+    if device is not None:
+        x = x.to(device)
+    return x.to(dtype)
 
-    # heading
-    heading_scores = box_pred[:, c:c + NUM_HEADING_BIN]
+def parse_output_to_tensors(box_pred, logits, mask, stage1_center, bs=None, n_obj=None):
+    """
+    Parse network outputs to separate tensors.
+    Args:
+        box_pred: (bs*N,59) or (bs,N,59) - box prediction
+        logits: (bs*N,n_points,2) or (bs,N,n_points,2) - segmentation logits
+        mask: (bs*N,n_points) or (bs,N,n_points) - segmentation mask
+        stage1_center: (bs*N,3) or (bs,N,3) - initial center prediction
+        bs: Optional batch size for reshaping
+        n_obj: Optional number of objects per batch for reshaping
+    Returns:
+        Dictionary containing parsed outputs with shape (bs,N,...)
+    """
+    device = box_pred.device
+    dtype = box_pred.dtype
+
+    # Reshape if needed
+    if bs is not None and n_obj is not None:
+        box_pred = box_pred.view(bs, n_obj, -1)
+        logits = logits.view(bs, n_obj, *logits.shape[1:])
+        mask = mask.view(bs, n_obj, -1)
+        stage1_center = stage1_center.view(bs, n_obj, 3)
+    else:
+        if len(box_pred.shape) == 2:
+            box_pred = box_pred.unsqueeze(0)
+            logits = logits.unsqueeze(0)
+            mask = mask.unsqueeze(0)
+            stage1_center = stage1_center.unsqueeze(0)
+    
+    bs, n_obj = box_pred.shape[:2]
+    c = 0
+
+    # Parse box prediction
+    center_boxnet = box_pred[:, :, c:c+3]  # (bs,N,3)
+    c += 3
+
+    heading_scores = box_pred[:, :, c:c+NUM_HEADING_BIN]  # (bs,N,NH)
     c += NUM_HEADING_BIN
-    heading_residual_normalized = box_pred[:, c:c + NUM_HEADING_BIN]
+    heading_residual_normalized = box_pred[:, :, c:c+NUM_HEADING_BIN]  # (bs,N,NH)
     heading_residual = heading_residual_normalized * (np.pi / NUM_HEADING_BIN)
     c += NUM_HEADING_BIN
 
-    # size
-    size_scores = box_pred[:, c:c + NUM_SIZE_CLUSTER]
+    size_scores = box_pred[:, :, c:c+NUM_SIZE_CLUSTER]  # (bs,N,NS)
     c += NUM_SIZE_CLUSTER
-    size_residual_normalized = box_pred[:, c:c + 3 * NUM_SIZE_CLUSTER].contiguous()
-    size_residual_normalized = size_residual_normalized.view(bs, NUM_SIZE_CLUSTER, 3)
-    size_residual = size_residual_normalized * \
-                     torch.from_numpy(g_mean_size_arr).unsqueeze(0).repeat(bs,1,1).cuda()
+    size_residual_normalized = box_pred[:, :, c:c+3*NUM_SIZE_CLUSTER]  # (bs,N,NS*3)
+    size_residual_normalized = size_residual_normalized.view(bs, n_obj, NUM_SIZE_CLUSTER, 3)
     
-    return center_boxnet, \
-            heading_scores, heading_residual_normalized, heading_residual, \
-            size_scores, size_residual_normalized, size_residual
+    # Convert mean size array to tensor
+    mean_size_arr = ensure_tensor(g_mean_size_arr, dtype=dtype, device=device)
+    size_residual = size_residual_normalized * mean_size_arr.view(1, 1, NUM_SIZE_CLUSTER, 3)
+
+    return {
+        'center_boxnet': center_boxnet,
+        'heading_scores': heading_scores,
+        'heading_residual_normalized': heading_residual_normalized,
+        'heading_residual': heading_residual,
+        'size_scores': size_scores,
+        'size_residual_normalized': size_residual_normalized,
+        'size_residual': size_residual,
+        'logits': logits,
+        'mask': mask,
+        'stage1_center': stage1_center
+    }
 
 def point_cloud_masking(pts, mask):
     '''
@@ -145,65 +172,64 @@ def gather_object_pts(pts, mask, n_pts=NUM_OBJECT_POINT):
         ###else?
     return object_pts, indices
 
-
 def get_box3d_corners_helper(centers, headings, sizes):
-    """ 
-    Input: 
-        centers: (N,3) or (3,) numpy array or torch tensor
-        headings: (N,) or scalar numpy array or torch tensor
-        sizes: (N,3) or (3,) numpy array or torch tensor
-    Output: 
-        corners: (N,8,3) or (8,3) numpy array
     """
-    # Convert numpy arrays to tensors if needed
-    if isinstance(centers, np.ndarray):
-        centers = torch.from_numpy(centers).float().cuda()
-    if isinstance(headings, (np.ndarray, float, int)):
-        headings = torch.tensor(headings).float().cuda()
-    if isinstance(sizes, np.ndarray):
-        sizes = torch.from_numpy(sizes).float().cuda()
+    Convert box parameters to corner coordinates.
+    Args:
+        centers: (bs,N,3) or (N,3) - box centers
+        headings: (bs,N) or (N,) - heading angles
+        sizes: (bs,N,3) or (N,3) - box sizes (l,w,h)
+    Returns:
+        corners: (bs,N,8,3) or (N,8,3) - 3D box corners
+    """
+    device = centers.device
+    dtype = centers.dtype
     
-    # Handle single box case
-    if len(centers.shape) == 1:
+    # Ensure inputs are proper tensors
+    centers = ensure_tensor(centers, dtype=dtype, device=device)
+    headings = ensure_tensor(headings, dtype=dtype, device=device)
+    sizes = ensure_tensor(sizes, dtype=dtype, device=device)
+    
+    # Add batch dimension if needed
+    if len(centers.shape) == 2:
         centers = centers.unsqueeze(0)
-    if isinstance(headings, (float, int)) or (isinstance(headings, torch.Tensor) and len(headings.shape) == 0):
         headings = headings.unsqueeze(0)
-    if len(sizes.shape) == 1:
         sizes = sizes.unsqueeze(0)
-
-    N = centers.shape[0]
-    l = sizes[:,0].view(N,1)
-    w = sizes[:,1].view(N,1)
-    h = sizes[:,2].view(N,1)
-
-    x_corners = torch.cat([l/2,l/2,-l/2,-l/2,l/2,l/2,-l/2,-l/2], dim=1) # (N,8)
-    y_corners = torch.cat([h/2,h/2,h/2,h/2,-h/2,-h/2,-h/2,-h/2], dim=1) # (N,8)
-    z_corners = torch.cat([w/2,-w/2,-w/2,w/2,w/2,-w/2,-w/2,w/2], dim=1) # (N,8)
-    corners = torch.cat([x_corners.view(N,1,8), y_corners.view(N,1,8),\
-                            z_corners.view(N,1,8)], dim=1) # (N,3,8)
-
-    c = torch.cos(headings)
-    s = torch.sin(headings)
-    ones = torch.ones([N], dtype=torch.float32).cuda()
-    zeros = torch.zeros([N], dtype=torch.float32).cuda()
-    row1 = torch.stack([c,zeros,s], dim=1) # (N,3)
-    row2 = torch.stack([zeros,ones,zeros], dim=1)
-    row3 = torch.stack([-s,zeros,c], dim=1)
-    R = torch.cat([row1.view(N,1,3), row2.view(N,1,3), \
-                      row3.view(N,1,3)], axis=1) # (N,3,3)
-
-    corners_3d = torch.bmm(R, corners) # (N,3,8)
-    corners_3d +=centers.view(N,3,1).repeat(1,1,8) # (N,3,8)
-    corners_3d = torch.transpose(corners_3d,1,2) # (N,8,3)
     
-    # Convert back to numpy - detach first if requires grad
-    corners_3d = corners_3d.detach().cpu().numpy()
+    bs, n_obj = centers.shape[:2]
     
-    # If input was single box, squeeze the first dimension
-    if N == 1:
-        corners_3d = corners_3d.squeeze(0)
-    
-    return corners_3d
+    # Get box dimensions
+    l = sizes[..., 0].view(bs, n_obj, 1)  # (bs,N,1)
+    w = sizes[..., 1].view(bs, n_obj, 1)  # (bs,N,1)
+    h = sizes[..., 2].view(bs, n_obj, 1)  # (bs,N,1)
+
+    # Create corner coordinates relative to center
+    x_corners = torch.cat([l/2,l/2,-l/2,-l/2,l/2,l/2,-l/2,-l/2], dim=2)  # (bs,N,8)
+    y_corners = torch.cat([h/2,h/2,h/2,h/2,-h/2,-h/2,-h/2,-h/2], dim=2)  # (bs,N,8)
+    z_corners = torch.cat([w/2,-w/2,-w/2,w/2,w/2,-w/2,-w/2,w/2], dim=2)  # (bs,N,8)
+    corners = torch.stack([x_corners, y_corners, z_corners], dim=3)  # (bs,N,8,3)
+
+    # Create rotation matrices
+    cos_angle = torch.cos(headings).view(bs, n_obj, 1, 1)  # (bs,N,1,1)
+    sin_angle = torch.sin(headings).view(bs, n_obj, 1, 1)  # (bs,N,1,1)
+    zeros = torch.zeros_like(cos_angle, device=device, dtype=dtype)  # (bs,N,1,1)
+    ones = torch.ones_like(cos_angle, device=device, dtype=dtype)   # (bs,N,1,1)
+
+    R = torch.cat([
+        torch.cat([cos_angle, zeros, sin_angle], dim=3),   # (bs,N,1,3)
+        torch.cat([zeros, ones, zeros], dim=3),            # (bs,N,1,3)
+        torch.cat([-sin_angle, zeros, cos_angle], dim=3)   # (bs,N,1,3)
+    ], dim=2)  # (bs,N,3,3)
+
+    # Rotate and translate corners
+    corners = torch.matmul(corners, R.transpose(2, 3))  # (bs,N,8,3)
+    corners = corners + centers.unsqueeze(2)  # (bs,N,8,3)
+
+    # Remove batch dimension if input was unbatched
+    if len(centers.shape) == 2:
+        corners = corners.squeeze(0)
+
+    return corners
 
 def get_box3d_corners(center, heading_residual, size_residual):
     """
@@ -214,12 +240,13 @@ def get_box3d_corners(center, heading_residual, size_residual):
     Outputs:
         box3d_corners: (bs,NH,NS,8,3) tensor
     """
+    device = center.device
     bs = center.shape[0]
     heading_bin_centers = torch.from_numpy(\
-            np.arange(0,2*np.pi,2*np.pi/NUM_HEADING_BIN)).float().cuda() # (NH,)
+            np.arange(0,2*np.pi,2*np.pi/NUM_HEADING_BIN)).float().to(device) # (NH,)
     headings = heading_residual + heading_bin_centers.view(1,-1) # (bs,NH)
 
-    mean_sizes = torch.from_numpy(g_mean_size_arr).float().cuda() # (1,3)
+    mean_sizes = torch.from_numpy(g_mean_size_arr).float().to(device) # (1,3)
     sizes = mean_sizes.view(1,1,3) + size_residual # (bs,1,3)
     sizes = sizes.view(bs,1,NUM_SIZE_CLUSTER,3)\
                 .repeat(1,NUM_HEADING_BIN,1,1).float() # (bs,NH,1,3)
@@ -231,136 +258,204 @@ def get_box3d_corners(center, heading_residual, size_residual):
                                         headings.view(N),
                                         sizes.view(N,3))
     
-    # Convert corners_3d back to torch tensor since helper returns numpy array
-    corners_3d = torch.from_numpy(corners_3d).float().cuda()
-    
-    # Reshape using view with a tuple for the target shape
     return corners_3d.view((bs, NUM_HEADING_BIN, NUM_SIZE_CLUSTER, 8, 3))
 
-def huber_loss(error, delta=1.0):#(32,), ()
+def huber_loss(error, delta=1.0):
+    """
+    Compute the Huber loss.
+    Args:
+        error: Tensor of any shape - error between predictions and targets
+        delta: Float scalar - Huber loss parameter (default: 1.0)
+    Returns:
+        loss: Reduced Huber loss (always non-negative)
+    """
+    device = error.device
+    dtype = error.dtype
+    
+    # Ensure error is properly handled
     abs_error = torch.abs(error)
-    quadratic = torch.clamp(abs_error, max=delta)
-    linear = (abs_error - quadratic)
-    losses = 0.5 * quadratic**2 + delta * linear
-    return torch.mean(losses)
+    delta = ensure_tensor(delta, dtype=dtype, device=device)
+    
+    # Compute quadratic and linear terms
+    quadratic = torch.minimum(abs_error, delta)
+    linear = abs_error - quadratic
+    
+    # Compute final loss (always non-negative since we use abs_error)
+    loss = 0.5 * quadratic.pow(2) + delta * linear
+    
+    return torch.mean(loss)
 
 class FrustumPointNetLoss(nn.Module):
     def __init__(self):
         super(FrustumPointNetLoss, self).__init__()
 
-    def forward(self, logits, mask_label, \
-                 center, center_label, stage1_center, \
-                 heading_scores, heading_residual_normalized, heading_residual, \
-                 heading_class_label, heading_residual_label, \
-                 size_scores, size_residual_normalized, size_residual,
-                 size_class_label, size_residual_label,
-                 corner_loss_weight=10.0, box_loss_weight=1.0):
-        '''
-        Binary classification for object detection and 3D box estimation
-        '''
-        device = logits.device
-        
-        print("\n=== Model Outputs ===")
-        print(f"Logits shape: {logits.shape}, range: [{logits.min():.3f}, {logits.max():.3f}]")
-        print(f"Center shape: {center.shape}, values: {center[0]}")
-        print(f"Stage1 Center shape: {stage1_center.shape}, values: {stage1_center[0]}")
-        print(f"Heading scores shape: {heading_scores.shape}, values: {heading_scores[0]}")
-        print(f"Heading residual shape: {heading_residual.shape}, values: {heading_residual[0]}")
-        print(f"Size scores shape: {size_scores.shape}, values: {size_scores[0]}")
-        print(f"Size residual shape: {size_residual.shape}, values: {size_residual[0]}")
-        
-        print("\n=== Ground Truth ===")
-        print(f"Mask label shape: {mask_label.shape}, unique values: {torch.unique(mask_label)}")
-        print(f"Center label shape: {center_label.shape}, values: {center_label[0]}")
-        print(f"Heading class label shape: {heading_class_label.shape}, values: {heading_class_label[0]}")
-        print(f"Heading residual label shape: {heading_residual_label.shape}, values: {heading_residual_label[0]}")
-        print(f"Size class label shape: {size_class_label.shape}, values: {size_class_label[0]}")
-        print(f"Size residual label shape: {size_residual_label.shape}, values: {size_residual_label[0]}")
-        
-        # Binary classification loss (object vs. not object)
-        logits = F.log_softmax(logits.view(-1,2), dim=1)  # (bs*n_points, 2)
-        mask_label = mask_label.view(-1).long()  # (bs*n_points,)
-        mask_loss = F.nll_loss(logits, mask_label)
-        print(f"\nMask Loss: {mask_loss.item():.4f}")
-        
-        # Center Regression Loss
-        center_dist = torch.norm(center - center_label, dim=1)
-        center_loss = huber_loss(center_dist, delta=2.0)
-        print(f"Center Loss: {center_loss.item():.4f}")
-        print(f"Center distances: min={center_dist.min().item():.4f}, max={center_dist.max().item():.4f}, mean={center_dist.mean().item():.4f}")
-        
-        stage1_center_dist = torch.norm(center - stage1_center, dim=1)
-        stage1_center_loss = huber_loss(stage1_center_dist, delta=1.0)
-        print(f"Stage1 Center Loss: {stage1_center_loss.item():.4f}")
-        
-        # Heading Loss
-        heading_class_loss = F.nll_loss(F.log_softmax(heading_scores, dim=1), heading_class_label.long())
-        print(f"Heading Class Loss: {heading_class_loss.item():.4f}")
-        print(f"Predicted heading class: {torch.argmax(heading_scores, dim=1)[0]}, GT: {heading_class_label[0]}")
-        
-        hcls_onehot = torch.eye(NUM_HEADING_BIN, device=device)[heading_class_label.long()]
-        heading_residual_normalized_label = heading_residual_label / (np.pi/NUM_HEADING_BIN)
-        heading_residual_normalized_dist = torch.sum(heading_residual_normalized * hcls_onehot, dim=1)
-        heading_residual_normalized_loss = huber_loss(heading_residual_normalized_dist - heading_residual_normalized_label, delta=1.0)
-        print(f"Heading Residual Loss: {heading_residual_normalized_loss.item():.4f}")
-        
-        # Size loss (simplified for single class)
-        size_residual_normalized_dist = size_residual_normalized.squeeze(1)
-        mean_size_arr_expand = torch.from_numpy(g_mean_size_arr).float().to(device)
-        size_residual_label_normalized = size_residual_label / mean_size_arr_expand[0]
-        size_normalized_dist = torch.norm(size_residual_label_normalized - size_residual_normalized_dist, dim=1)
-        size_residual_normalized_loss = huber_loss(size_normalized_dist, delta=1.0)
-        print(f"Size Residual Loss: {size_residual_normalized_loss.item():.4f}")
+    def forward(self, predictions, targets, valid_mask=None):
+        """
+        Compute all losses for Frustum PointNet.
+        Args:
+            predictions: Dictionary containing network predictions
+            targets: Dictionary containing ground truth
+            valid_mask: (bs,N) boolean mask for valid objects
+        Returns:
+            total_loss: Scalar total loss (guaranteed non-negative)
+            loss_dict: Dictionary of individual losses (all non-negative)
+        """
+        device = predictions['logits'].device
+        dtype = predictions['logits'].dtype
+        bs, n_obj = predictions['logits'].shape[:2]
 
-        # Corner Loss
-        corners_3d = get_box3d_corners(center, heading_residual, size_residual)  # This now returns a tensor
-        pred_heading_class = torch.argmax(heading_scores, dim=1)
-        pred_corners = corners_3d[torch.arange(corners_3d.shape[0]), pred_heading_class, 0]
-        
-        # Convert heading_residual_label to tensor if it's not already
-        gt_heading = heading_residual_label.view(-1,1)
-        gt_size = size_residual_label
-        
-        # Create tensors for both normal and flipped corners
-        gt_corners = torch.from_numpy(get_box3d_corners_helper(center_label, gt_heading.squeeze(1), gt_size)).float().to(device)
-        gt_corners_flipped = torch.from_numpy(get_box3d_corners_helper(center_label, gt_heading.squeeze(1) + np.pi, gt_size)).float().to(device)
-        
-        # Calculate corner loss using torch operations
-        corners_dist = torch.min(
-            torch.mean(torch.norm(pred_corners - gt_corners, dim=2), dim=1),
-            torch.mean(torch.norm(pred_corners - gt_corners_flipped, dim=2), dim=1)
+        print("\n=== FrustumPointNetLoss Debug Information ===")
+        print(f"Batch size: {bs}, Objects per batch: {n_obj}")
+
+        # If no valid_mask provided, assume all objects are valid
+        if valid_mask is None:
+            valid_mask = torch.ones((bs, n_obj), dtype=torch.bool, device=device)
+        print(f"Number of valid objects: {valid_mask.sum().item()}")
+
+        # Compute segmentation loss (non-negative)
+        seg_loss = F.cross_entropy(
+            predictions['logits'][valid_mask].permute(0,2,1),  # (N,2,n_points)
+            targets['seg'][valid_mask].long(),  # (N,n_points)
+            reduction='mean'
         )
-        corner_loss = huber_loss(corners_dist, delta=1.0)
-        print(f"Corner Loss: {corner_loss.item():.4f}")
-        print(f"Corner distances: min={corners_dist.min().item():.4f}, max={corners_dist.max().item():.4f}, mean={corners_dist.mean().item():.4f}")
+        print(f"\nSegmentation Loss: {seg_loss.item():.6f}")
+
+        # Compute center loss (non-negative due to norm)
+        center_loss = torch.mean(
+            torch.norm(predictions['box3d_center'] - targets['box3d_center'], dim=2)[valid_mask]
+        )
+        print(f"Center Loss: {center_loss.item():.6f}")
         
-        # Weighted sum of all losses
-        total_loss = mask_loss + box_loss_weight * (center_loss + \
-                    heading_class_loss + \
-                    heading_residual_normalized_loss * 20 + \
-                    size_residual_normalized_loss * 20 + \
+        stage1_center_loss = torch.mean(
+            torch.norm(predictions['stage1_center'] - targets['box3d_center'], dim=2)[valid_mask]
+        )
+        print(f"Stage1 Center Loss: {stage1_center_loss.item():.6f}")
+
+        # Compute heading loss (non-negative)
+        heading_class_loss = F.cross_entropy(
+            predictions['heading_scores'][valid_mask],  # (N,NH)
+            targets['angle_class'][valid_mask].long(),  # (N,)
+            reduction='mean',
+            label_smoothing=0.1  # Add label smoothing to improve generalization
+        )
+        
+        # Compute heading residual loss with periodic consideration
+        heading_residual_normalized_label = targets['angle_residual'] / (np.pi/NUM_HEADING_BIN)
+        heading_residual_pred = torch.gather(
+            predictions['heading_residual_normalized'][valid_mask],  # (N,NH)
+            1,
+            targets['angle_class'][valid_mask].long().unsqueeze(1)  # (N,1)
+        ).squeeze(1)  # (N,)
+        
+        # Use periodic loss for heading residual
+        heading_diff = heading_residual_pred - heading_residual_normalized_label[valid_mask]
+        # Normalize to [-0.5, 0.5] range within bin
+        heading_diff = torch.where(heading_diff > 0.5, heading_diff - 1.0, heading_diff)
+        heading_diff = torch.where(heading_diff < -0.5, heading_diff + 1.0, heading_diff)
+        heading_residual_normalized_loss = huber_loss(heading_diff, delta=1.0)
+
+        # Reduce multiplier from 20x to 10x
+        heading_residual_weight = 10.0  # Changed from 20.0
+
+        # Compute size loss (non-negative)
+        size_class_loss = F.cross_entropy(
+            predictions['size_scores'][valid_mask],  # (N,NS)
+            targets['size_class'][valid_mask].long(),  # (N,)
+            reduction='mean'
+        )
+        print(f"Size Class Loss: {size_class_loss.item():.6f}")
+        
+        # Compute size residual loss
+        size_residual_pred = torch.gather(
+            predictions['size_residual_normalized'][valid_mask],  # (N,NS,3)
+            1,
+            targets['size_class'][valid_mask].long().unsqueeze(1).unsqueeze(2).expand(-1,-1,3)  # (N,1,3)
+        ).squeeze(1)  # (N,3)
+        
+        # Print size residual debug info
+        print("\nSize Residual Debug:")
+        print(f"Pred range: [{size_residual_pred.min().item():.6f}, {size_residual_pred.max().item():.6f}]")
+        print(f"Label range: [{targets['size_residual'][valid_mask].min().item():.6f}, {targets['size_residual'][valid_mask].max().item():.6f}]")
+        
+        # Compute size residual loss using absolute difference
+        size_diff = size_residual_pred - targets['size_residual'][valid_mask]
+        size_residual_normalized_loss = huber_loss(size_diff, delta=1.0)
+        print(f"Size Residual Loss: {size_residual_normalized_loss.item():.6f}")
+
+        # Compute corner loss
+        corners_3d = get_box3d_corners_helper(
+            predictions['box3d_center'][valid_mask],
+            predictions['heading_residual'][valid_mask].gather(
+                1,
+                targets['angle_class'][valid_mask].long().unsqueeze(1)
+            ).squeeze(1),
+            predictions['size_residual'][valid_mask].gather(
+                1,
+                targets['size_class'][valid_mask].long().unsqueeze(1).unsqueeze(2).expand(-1,-1,3)
+            ).squeeze(1)
+        )
+        
+        gt_corners_3d = get_box3d_corners_helper(
+            targets['box3d_center'][valid_mask],
+            targets['angle_residual'][valid_mask],
+            targets['size_residual'][valid_mask]
+        )
+        
+        # Print corners debug info
+        print("\nCorners Debug:")
+        print(f"Pred corners range: [{corners_3d.min().item():.6f}, {corners_3d.max().item():.6f}]")
+        print(f"GT corners range: [{gt_corners_3d.min().item():.6f}, {gt_corners_3d.max().item():.6f}]")
+        
+        # Compute corner loss using absolute difference
+        corners_diff = corners_3d - gt_corners_3d
+        corners_loss = huber_loss(corners_diff, delta=1.0)
+        print(f"Corners Loss: {corners_loss.item():.6f}")
+
+        # Verify all losses are non-negative
+        assert torch.all(seg_loss >= 0), f"Segmentation loss should be non-negative, got {seg_loss}"
+        assert torch.all(center_loss >= 0), f"Center loss should be non-negative, got {center_loss}"
+        assert torch.all(stage1_center_loss >= 0), f"Stage1 center loss should be non-negative, got {stage1_center_loss}"
+        assert torch.all(heading_class_loss >= 0), f"Heading class loss should be non-negative, got {heading_class_loss}"
+        assert torch.all(size_class_loss >= 0), f"Size class loss should be non-negative, got {size_class_loss}"
+        assert torch.all(heading_residual_normalized_loss >= 0), f"Heading residual loss should be non-negative, got {heading_residual_normalized_loss}"
+        assert torch.all(size_residual_normalized_loss >= 0), f"Size residual loss should be non-negative, got {size_residual_normalized_loss}"
+        assert torch.all(corners_loss >= 0), f"Corners loss should be non-negative, got {corners_loss}"
+
+        # Total loss (weighted sum of non-negative terms)
+        total_loss = seg_loss + \
+                    0.5 * center_loss + \
                     stage1_center_loss + \
-                    corner_loss_weight * corner_loss)
-        
-        print(f"\n=== Final Weighted Losses ===")
-        print(f"Total Loss: {total_loss.item():.4f}")
-        print(f"Mask Loss (w=1.0): {mask_loss.item():.4f}")
-        print(f"Center Loss (w={box_loss_weight}): {(box_loss_weight * center_loss).item():.4f}")
-        print(f"Heading Class Loss (w={box_loss_weight}): {(box_loss_weight * heading_class_loss).item():.4f}")
-        print(f"Heading Residual Loss (w={box_loss_weight * 20}): {(box_loss_weight * heading_residual_normalized_loss * 20).item():.4f}")
-        print(f"Size Residual Loss (w={box_loss_weight * 20}): {(box_loss_weight * size_residual_normalized_loss * 20).item():.4f}")
-        print(f"Stage1 Center Loss (w={box_loss_weight}): {(box_loss_weight * stage1_center_loss).item():.4f}")
-        print(f"Corner Loss (w={box_loss_weight * corner_loss_weight}): {(box_loss_weight * corner_loss * corner_loss_weight).item():.4f}")
-        print("="*50)
-        
-        losses = {
+                    heading_class_loss + \
+                    size_class_loss + \
+                    heading_residual_normalized_loss * heading_residual_weight + \
+                    size_residual_normalized_loss * 20 + \
+                    corners_loss
+
+        print("\nWeighted Losses:")
+        print(f"Segmentation Loss: {seg_loss.item():.6f}")
+        print(f"Center Loss (0.5x): {(0.5 * center_loss).item():.6f}")
+        print(f"Stage1 Center Loss: {stage1_center_loss.item():.6f}")
+        print(f"Heading Class Loss: {heading_class_loss.item():.6f}")
+        print(f"Size Class Loss: {size_class_loss.item():.6f}")
+        print(f"Heading Residual Loss (10x): {(heading_residual_normalized_loss * heading_residual_weight).item():.6f}")
+        print(f"Size Residual Loss (20x): {(size_residual_normalized_loss * 20).item():.6f}")
+        print(f"Corners Loss: {corners_loss.item():.6f}")
+        print(f"Total Loss: {total_loss.item():.6f}")
+        print("="*40)
+
+        # Final sanity check
+        assert torch.all(total_loss >= 0), f"Total loss should be non-negative, got {total_loss}"
+
+        loss_dict = {
             'total_loss': total_loss,
-            'mask_loss': mask_loss,
-            'center_loss': box_loss_weight * center_loss,
-            'heading_class_loss': box_loss_weight * heading_class_loss,
-            'heading_residual_normalized_loss': box_loss_weight * heading_residual_normalized_loss * 20,
-            'size_residual_normalized_loss': box_loss_weight * size_residual_normalized_loss * 20,
-            'stage1_center_loss': box_loss_weight * stage1_center_loss,
-            'corners_loss': box_loss_weight * corner_loss * corner_loss_weight,
+            'seg_loss': seg_loss,
+            'center_loss': center_loss,
+            'heading_class_loss': heading_class_loss,
+            'size_class_loss': size_class_loss,
+            'heading_residual_normalized_loss': heading_residual_normalized_loss,
+            'size_residual_normalized_loss': size_residual_normalized_loss,
+            'stage1_center_loss': stage1_center_loss,
+            'corners_loss': corners_loss
         }
-        return losses
+
+        return total_loss, loss_dict
