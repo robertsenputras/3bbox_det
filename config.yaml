@@ -1,0 +1,42 @@
+# Mode configuration
+mode: 'dataset'  # 'single' or 'dataset'
+
+# Model paths
+model:
+  yolo_weights: 'ckpt/19June_1026.pt'
+  frustum_weights: 'ckpt/frustrum_2206_1007.pth'  # Path to Frustum-PointNet weights
+  frustum_version: 'v1'  # 'v1' or 'v2'
+  device: 'cuda'  # 'cuda' or 'cpu'
+
+# Dataset configuration (for dataset mode)
+dataset:
+  data_path: data/dl_challenge  # Path to dataset directory
+  num_points: 2048  # Number of points to sample per object
+  train_val_split: 0.9  # Ratio for train/val split
+  is_training: false  # Whether to use training or validation scenes
+  scene_list: null  # Optional: List of specific scenes to process. If null, uses train/val split
+
+
+# Detection parameters
+detection:
+  conf_threshold: 0.25  # Confidence threshold for detections
+  nms_threshold: 0.3   # IoU threshold for NMS
+
+# Visualization parameters
+visualization:
+  min_score: 0.5  # Minimum score for visualizing detections
+  show_boxes: true  # Whether to show 3D bounding boxes
+  show_scores: true  # Whether to show confidence scores
+  point_size: 2  # Size of points in visualization
+  box_line_width: 2  # Width of box lines in visualization
+  box_opacity: 0.7  # Opacity of boxes in visualization
+  show_suppressed_boxes: true  # Whether to show boxes suppressed by NMS
+  window_width: 1024  # Width of visualization window
+  window_height: 768  # Height of visualization window
+  window_left: 50  # Left position of window
+  window_top: 50  # Top position of window
+
+# Output configuration
+output:
+  dir: 'results'  # Directory to save visualization results
+  save_detections: true  # Whether to save detection results as numpy arrays 

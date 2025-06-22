@@ -405,9 +405,10 @@ def visualize_results(point_clouds, boxes_3d, scores, config):
         pcd.colors = o3d.utility.Vector3dVector(colors)
         geometries.append(pcd)
     
-    # Add coordinate frame
+    # Add coordinate frame with configured size
+    axis_size = config.get('visualization', {}).get('axis_size', 1.0)  # Default to 1.0 if not specified
     axis = o3d.geometry.TriangleMesh.create_coordinate_frame(
-        size=1.0,
+        size=axis_size,
         origin=[0, 0, 0]
     )
     geometries.append(axis)
