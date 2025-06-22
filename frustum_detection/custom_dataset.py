@@ -7,7 +7,8 @@ import random
 import logging
 
 class DLChallengeDataset(Dataset):
-    def __init__(self, data_root, scene_list=None, num_points=1024, rotate_to_center=True, random_flip=False, random_shift=False):
+    def __init__(self, data_root, scene_list=None, num_points=1024, rotate_to_center=True, 
+                 random_flip=False, random_shift=False, is_training=True):
         """
         Dataset for loading dl_challenge data format
         Args:
@@ -17,12 +18,14 @@ class DLChallengeDataset(Dataset):
             rotate_to_center: Whether to rotate frustum to face forward
             random_flip: Whether to randomly flip the frustum
             random_shift: Whether to randomly shift points
+            is_training: Whether in training mode (no image loading) or testing mode
         """
         self.data_root = Path(data_root)
         self.num_points = num_points
         self.rotate_to_center = rotate_to_center
         self.random_flip = random_flip
         self.random_shift = random_shift
+        self.is_training = is_training
         
         # Get data directories
         if scene_list is None:
@@ -30,7 +33,7 @@ class DLChallengeDataset(Dataset):
         else:
             self.data_dirs = scene_list
             
-        logging.info(f"Dataset initialized with {len(self.data_dirs)} scenes")
+        logging.info(f"Dataset initialized with {len(self.data_dirs)} scenes in {'training' if is_training else 'testing'} mode")
         
     def __len__(self):
         return len(self.data_dirs)
@@ -153,7 +156,6 @@ class DLChallengeDataset(Dataset):
         points = np.load(data_dir / 'pc.npy')  # (3, H, W) organized point cloud
         boxes = np.load(data_dir / 'bbox3d.npy')  # (N, 8, 3) box corners
         seg_masks = np.load(data_dir / 'mask.npy')  # (N, H, W) segmentation masks
-        image = np.load(data_dir / 'rgb.jpg')  # (H, W, 3) RGB image
         
         # Data augmentation on full point cloud
         if self.random_shift:
@@ -172,12 +174,47 @@ class DLChallengeDataset(Dataset):
         frustums = [torch.from_numpy(f).float() for f in frustums]
         frustum_masks = [torch.from_numpy(m).float() for m in frustum_masks]
         boxes = torch.from_numpy(boxes).float()
-        image = torch.from_numpy(image.transpose(2, 0, 1)).float() / 255.0
         
-        return {
-            'frustums': frustums,  # List of (num_points, 3) tensors
-            'frustum_masks': frustum_masks,  # List of (num_points,) tensors
-            'boxes': boxes,  # (N, 8, 3) tensor of box corners
-            'image': image,  # (3, H, W) tensor
-            'scene_id': data_dir.name
-        } 
+        # Stack frustums and add intensity channel (zeros)
+        if len(frustums) > 0:
+            point_clouds = torch.stack(frustums)  # (N, num_points, 3)
+            # Add intensity channel
+            intensities = torch.zeros(point_clouds.shape[:-1] + (1,))  # (N, num_points, 1)
+            point_clouds = torch.cat([point_clouds, intensities], dim=-1)  # (N, num_points, 4)
+            # Transpose to match model's expected format
+            point_clouds = point_clouds.transpose(2, 1)  # (N, 4, num_points)
+        else:
+            # Create dummy point cloud if no frustums
+            point_clouds = torch.zeros((1, 4, self.num_points), dtype=torch.float32)
+            frustum_masks = [torch.zeros(self.num_points, dtype=torch.float32)]
+        
+        # Create return dictionary
+        data_dict = {
+            'point_cloud': point_clouds,  # (N, 4, num_points)
+            'seg': torch.stack(frustum_masks) if len(frustum_masks) > 0 else torch.zeros((1, self.num_points)),  # (N, num_points)
+            'box3d_center': boxes.mean(dim=1),  # (N, 3)
+            'heading_class': torch.zeros(len(boxes), dtype=torch.long),  # (N,)
+            'heading_residual': torch.zeros(len(boxes)),  # (N,)
+            'size_class': torch.zeros(len(boxes), dtype=torch.long),  # (N,)
+            'size_residual': torch.zeros((len(boxes), 3)),  # (N, 3)
+            'rot_angle': torch.zeros(len(boxes)),  # (N,)
+            'scene_id': data_dir.name,
+            'one_hot': torch.tensor([1, 0, 0], dtype=torch.float32)  # 3D one-hot vector
+        }
+        
+        # Only load image in testing mode
+        if not self.is_training:
+            # Load image using cv2 and convert from BGR to RGB
+            image = cv2.imread(str(data_dir / 'rgb.jpg'))
+            if image is not None:
+                image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            else:
+                # If image loading fails, create a dummy image
+                H, W = points.shape[1:]
+                image = np.zeros((H, W, 3), dtype=np.uint8)
+            
+            # Convert image to tensor
+            image = torch.from_numpy(image.transpose(2, 0, 1)).float() / 255.0
+            data_dict['image'] = image  # (3, H, W) tensor
+        
+        return data_dict 
