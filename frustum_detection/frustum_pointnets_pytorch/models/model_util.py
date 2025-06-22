@@ -18,7 +18,7 @@ g_class2type = {0: 'Object'}
 g_type2onehotclass = {'Object': 0}
 
 # Mean size for single class (example values - adjust based on your data)
-g_type_mean_size = {'Object': np.array([0.1, 0.1, 0.1])}  # [length, width, height]
+g_type_mean_size = {'Object': np.array([0.2, 0.2, 0.2])}  # [length, width, height]
 g_mean_size_arr = np.zeros((NUM_SIZE_CLUSTER, 3))
 g_mean_size_arr[0,:] = g_type_mean_size['Object']
 

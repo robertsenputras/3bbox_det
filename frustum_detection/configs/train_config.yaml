@@ -12,16 +12,16 @@ random_shift: false  # Whether to randomly shift points during training
 
 # Training configuration
 batch_size: 8
-num_epochs: 100
-learning_rate: 0.001
-weight_decay: 0.0001
-lr_step_size: 20
-lr_gamma: 0.1
+num_epochs: 30
+learning_rate: 0.0001
+weight_decay: 0.00001
+lr_step_size: 10
+lr_gamma: 0.1 
 num_workers: 4
 
 # Loss weights
-center_weight: 2.0
-size_weight: 2.0
+center_weight: 4.0
+size_weight: 4.0
 heading_weight: 1.0
 mask_weight: 1.0
 
